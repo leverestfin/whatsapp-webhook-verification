@@ -27,11 +27,26 @@ module.exports = (req, res) => {
 
   return res.status(405).send("Method Not Allowed");
 };
-
 // api/webhook.js
-export default function handler(req, res) {
+async function getBody(req) {
+  // If body already parsed (Next.js API / some environments)
+  if (req.body && typeof req.body === "object") return req.body;
+
+  // If it's a string, try JSON.parse
+  if (typeof req.body === "string") {
+    try { return JSON.parse(req.body); } catch { return {}; }
+  }
+
+  // Fallback: read raw stream
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  const raw = Buffer.concat(chunks).toString("utf8") || "";
+
+  try { return raw ? JSON.parse(raw) : {}; } catch { return { _raw: raw }; }
+}
+
+export default async function handler(req, res) {
   if (req.method === "GET") {
-    // --- Initial verification for WhatsApp ---
     const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "change-me";
     const mode = req.query["hub.mode"];
     const token = req.query["hub.verify_token"];
@@ -45,40 +60,45 @@ export default function handler(req, res) {
   }
 
   if (req.method === "POST") {
-    const body = req.body;
+    const body = await getBody(req);
 
-    // ✅ DELIVERY STATUS HANDLING
     try {
-      const changes = body.entry?.[0]?.changes?.[0];
+      const changes = body?.entry?.[0]?.changes?.[0];
       const value = changes?.value;
 
-      // When WhatsApp sends delivery/read updates, they appear in value.statuses
-      if (value?.statuses) {
-        value.statuses.forEach((status) => {
+      // 🔔 Delivery / read / failed updates
+      if (Array.isArray(value?.statuses) && value.statuses.length > 0) {
+        value.statuses.forEach((s) => {
           console.log("📩 Delivery status update:");
-          console.log(`Message ID: ${status.id}`);
-          console.log(`Recipient: ${status.recipient_id}`);
-          console.log(`Status: ${status.status}`); // sent | delivered | read | failed
-          console.log(
-            `Time: ${new Date(status.timestamp * 1000).toISOString()}`
-          );
-
-          // If failed, log error info if available
-          if (status.errors) {
-            console.log("Error details:", JSON.stringify(status.errors));
+          console.log(`Message ID: ${s.id}`);
+          console.log(`Recipient: ${s.recipient_id}`);
+          console.log(`Status: ${s.status}`); // sent | delivered | read | failed
+          if (s.timestamp) {
+            console.log(`Time: ${new Date(Number(s.timestamp) * 1000).toISOString()}`);
+          }
+          if (s.errors) {
+            console.log("Error details:", JSON.stringify(s.errors));
           }
         });
-      } else {
-        // Other webhook events (like new inbound messages)
-        console.log("New message or other event:", JSON.stringify(body, null, 2));
       }
-    } catch (e) {
-      console.error("Error parsing webhook:", e, JSON.stringify(body));
+      // 💬 Inbound messages or other events
+      else if (Array.isArray(value?.messages) && value.messages.length > 0) {
+        console.log("💬 Inbound / other message event:", JSON.stringify(value.messages, null, 2));
+      }
+      // 🧪 Nothing matched? Log diagnostics so we can see what's arriving
+      else {
+        console.log("🔎 No statuses/messages detected. Diagnostics:");
+        console.log("Headers:", JSON.stringify(req.headers, null, 2));
+        console.log("Body:", JSON.stringify(body, null, 2));
+      }
+    } catch (err) {
+      console.error("❌ Error parsing webhook:", err);
+      console.log("Raw body for investigation:", JSON.stringify(body, null, 2));
     }
 
     return res.status(200).send("EVENT_RECEIVED");
   }
 
-  // If WhatsApp sends something unexpected
   return res.status(405).send("Method Not Allowed");
 }
+
